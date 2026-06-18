@@ -1,0 +1,535 @@
+// ============================================================
+// T-JOINT AS WAAM PROCESS - ELEMENT ACTIVATION
+// FreeFEM++  |  Vertical plate built layer-by-layer on base plate
+//
+// CONCEPT: The vertical plate from the T-joint welding simulation
+// is now the WAAM deposit, built up 3mm/layer on the base plate.
+// This bridges arc welding and additive manufacturing:
+//   Arc welding  -> joins pre-existing plates
+//   WAAM         -> builds the vertical plate from scratch
+//
+// GEOMETRY:
+//   Base plate (substrate): 200 x 100 x 10 mm  (pre-existing)
+//   WAAM deposit:           200 x   8 x 80 mm  (26 layers x 3mm)
+//   Deposition centred at y = LyBase/2 (same as vertical plate)
+//
+//         z
+//         |  Layer 26  <- last deposited (z=88mm)
+//         |  Layer 25
+//         |  ...
+//         |  Layer  2  (z=13mm)
+//  HzBase |  Layer  1  <- first deposited ON base plate (z=10-13mm)
+//         |  BASE PLATE (substrate)
+//       0 +---------------------------------- x
+//                torch traverses in +X for each layer
+//
+// ELEMENT ACTIVATION (quiet element method):
+//   Each layer starts QUIET: k*=1e-4*k_real, Cp*=1e-4*Cp_real
+//   At t=t_activate(iL): elements set to full properties + T=Tliq
+//   Activation: gradual tanh ramp over 5s for smooth transition
+//
+// PHYSICS: 3D transient heat transfer
+//   Same Goldak source as T-joint but z-centre rises each layer
+//   Moving source: x from 0->LxW at vscan=10mm/s per layer
+//   Inter-layer wait: 60s cooling before next pass
+//
+// OUTPUT:
+//   PVD animation showing layers activating one by one
+//   Temperature field + activation field per frame
+//   CSV: layer-by-layer peak T, inter-pass temperature, pool dims
+// ============================================================
+
+load "iovtk"
+
+string outdir = "D:\\freefem++\\arc_waam_simulation\\";
+system("mkdir \"D:\\freefem++\\arc_waam_simulation\"");
+
+// ============================================================
+// GEOMETRY
+// ============================================================
+real LxW    = 0.200;   // length X [m]
+real LyBase = 0.100;   // base plate width Y [m]
+real HzBase = 0.010;   // substrate thickness Z [m]
+real TyDep  = 0.008;   // deposit width Y [m]  (= vertical plate thickness)
+real hBead  = 0.003;   // single layer height Z [m]
+int  Nlayers= 26;      // number of WAAM layers
+real HzDep  = hBead*Nlayers;          // total deposit height = 78mm
+real HzTot  = HzBase + HzDep;         // total domain height = 88mm
+
+// Deposit centred on base plate
+real yDepCentre = LyBase/2.;           // = 50mm
+real yDepLeft   = yDepCentre - TyDep/2.;  // = 46mm
+real yDepRight  = yDepCentre + TyDep/2.;  // = 54mm
+
+// ============================================================
+// WAAM PROCESS PARAMETERS
+// ============================================================
+real Iweld  = 200.;
+real Uweld  = 24.;
+real etaArc = 0.8;
+real Pweld  = Iweld*Uweld*etaArc;   // 3840 W
+real vscan  = 10.e-3;               // traverse speed [m/s]
+real tPass  = LxW/vscan;            // time per layer pass = 20s
+real tWait  = 60.;                  // inter-layer cooling [s]
+real Ttotal = Nlayers*(tPass+tWait);// total simulation time
+
+// Goldak parameters (mesh-calibrated, axes >= element size)
+real af = 8.e-3; real ar = 20.e-3;
+real bG = 7.e-3; real cG = 4.e-3;
+real ff = 0.6;   real fr = 1.4;
+real piVal = 3.14159265358979;
+real Q0f = 6.*sqrt(3.)*ff*Pweld/(ff*piVal*sqrt(piVal)*af*bG*cG);
+real Q0r = 6.*sqrt(3.)*fr*Pweld/(fr*piVal*sqrt(piVal)*ar*bG*cG);
+
+// Timestep: dt_weld during welding, dt_wait during inter-pass
+real dtWeld = 0.333;   // welding dt [s]  (vscan*dt = 3.3mm ~ 0.5*hx)
+real dtWait = 10.;     // inter-pass dt [s]
+
+// Material
+real Tsol   = 1450.;   // solidus [C]
+real Tliq   = 1520.;   // liquidus [C]
+real Tamb   = 25.;     // ambient [C]
+real TdepInit = Tamb;   // activate at ambient -- Goldak source heats to Tliq
+                         // (setting to Tliq caused double-heating: Tliq + Q_arc)
+real rhoS   = 7850.;   // density [kg/m3]
+real hConv  = 15.;
+real hBot   = 50.;
+
+cout << "==========================================" << endl;
+cout << " T-JOINT AS WAAM PROCESS" << endl;
+cout << " Substrate: " << LxW*1000. << "x" << LyBase*1000.
+     << "x" << HzBase*1000. << "mm" << endl;
+cout << " Deposit: " << Nlayers << " layers x " << hBead*1000.
+     << "mm = " << HzDep*1000. << "mm total" << endl;
+cout << " Width: " << TyDep*1000. << "mm  centred at y=" << yDepCentre*1000. << "mm" << endl;
+cout << " P=" << Pweld << "W  v=" << vscan*1000. << "mm/s" << endl;
+cout << " tPass=" << tPass << "s  tWait=" << tWait << "s  Total=" << Ttotal << "s" << endl;
+cout << "==========================================" << endl;
+
+// ============================================================
+// MATERIAL
+// ============================================================
+func real kSteel(real T) {
+    if (T<=800.)  return 60.-(60.-38.)*T/800.;
+    if (T<=Tsol)  return 38.-(38.-27.)*(T-800.)/(Tsol-800.);
+    return 27.;
+}
+func real CpSteel(real T) {
+    if (T<=600.)  return 440.+(600.-440.)*T/600.;
+    if (T<=720.)  return 600.+(5000.-600.)*(T-600.)/120.;
+    if (T<=800.)  return 5000.-(5000.-650.)*(T-720.)/80.;
+    if (T<=Tsol)  return 650.-(650.-600.)*(T-800.)/(Tsol-800.);
+    return 800.;
+}
+
+// ============================================================
+// MESH: base plate + full deposition zone (all layers)
+// Base plate: x[0,Lx], y[0,Ly], z[0,HzBase]
+// Deposit zone: x[0,Lx], y[yDepLeft,yDepRight], z[HzBase,HzTot]
+// Linear movemesh3 only
+// ============================================================
+int NxB=30; int NyB=20; int NzB=8;
+int NxD=30; int NyD=6;  int NzD=26;  // NzD = Nlayers (1 element/layer)
+
+// Base plate
+real scXB=LxW; real scYB=LyBase; real scZB=HzBase;
+mesh3 ThBaseBox = cube(NxB,NyB,NzB);
+mesh3 ThBase    = movemesh3(ThBaseBox, transfo=[scXB*x, scYB*y, scZB*z]);
+
+// Deposition zone (all 26 layers pre-meshed, activated progressively)
+real scXD=LxW;
+real scYD=TyDep;    real shYD=yDepLeft;
+real scZD=HzDep;    real shZD=HzBase;
+mesh3 ThDepBox = cube(NxD,NyD,NzD);
+mesh3 ThDep    = movemesh3(ThDepBox, transfo=[
+    scXD*x,
+    shYD + scYD*y,
+    shZD + scZD*z
+]);
+
+mesh3 Th = ThBase + ThDep;
+cout << " Base: " << ThBase.nv << " nodes" << endl;
+cout << " Deposit zone: " << ThDep.nv << " nodes" << endl;
+cout << " Combined: " << Th.nv << " nodes  " << Th.nt << " tets" << endl;
+
+// ============================================================
+// FE SPACES
+// ============================================================
+fespace Sh(Th, P1);
+fespace Vh(Th, [P1,P1,P1]);
+
+Sh Temp, Temp0, dTemp;
+Sh kEff, CpEff, Tsource;
+Sh psiActive;   // activation field: 0=quiet, 1=fully active
+Sh epsTh;       // cumulative thermal strain (for mechanical post-process)
+Sh TempVis;     // masked temperature: -1 for inactive nodes (easy threshold in ParaView)
+
+Vh [ux,uy,uz];
+Vh [vx,vy,vz];
+Sh dispM, sigM;
+
+// ============================================================
+// INITIAL CONDITIONS
+// ============================================================
+Temp      = Tamb;
+Temp0     = Tamb;
+epsTh     = 0.;
+ux[]      = 0.;
+
+// Substrate always active, deposit starts quiet
+for(int iv=0; iv<Th.nv; iv++){
+    real zv = Th(iv).z;
+    if(zv <= HzBase+1.e-6){
+        psiActive[][iv] = 1.;         // substrate: fully active
+        kEff[][iv]      = kSteel(Tamb);
+        CpEff[][iv]     = CpSteel(Tamb);
+    } else {
+        psiActive[][iv] = 0.;         // deposit: quiet initially
+        kEff[][iv]      = kSteel(Tamb)*1.e-4;
+        CpEff[][iv]     = CpSteel(Tamb)*1.e-4;
+    }
+}
+
+// ============================================================
+// VARIATIONAL FORMS
+// ============================================================
+real thetaT = 0.5;
+real dt     = dtWeld;
+
+varf aThermal(Temp, dTemp) =
+    int3d(Th)(
+        rhoS*CpEff/dt * Temp*dTemp
+      + thetaT*kEff*(dx(Temp)*dx(dTemp)+dy(Temp)*dy(dTemp)+dz(Temp)*dz(dTemp))
+    )
+    + int2d(Th,1)( hBot  *Temp*dTemp )
+    + int2d(Th,2)( hConv *Temp*dTemp )
+    + int2d(Th,3)( hConv *Temp*dTemp )
+    + int2d(Th,4)( hConv *Temp*dTemp )
+    + int2d(Th,5)( hConv *Temp*dTemp )
+    + int2d(Th,6)( hConv *Temp*dTemp )
+    ;
+
+varf lThermal(Temp, dTemp) =
+    int3d(Th)(
+        rhoS*CpEff/dt * Temp0*dTemp
+      - (1.-thetaT)*kEff*(
+            dx(Temp0)*dx(dTemp)+dy(Temp0)*dy(dTemp)+dz(Temp0)*dz(dTemp))
+      + Tsource*dTemp
+    )
+    + int2d(Th,1)( hBot  *Tamb*dTemp )
+    + int2d(Th,2)( hConv *Tamb*dTemp )
+    + int2d(Th,3)( hConv *Tamb*dTemp )
+    + int2d(Th,4)( hConv *Tamb*dTemp )
+    + int2d(Th,5)( hConv *Tamb*dTemp )
+    + int2d(Th,6)( hConv *Tamb*dTemp )
+    ;
+
+// ============================================================
+// OUTPUT SETUP
+// ============================================================
+{
+    ofstream f(outdir+"waam.pvd");
+    f<<"<?xml version='1.0'?>"<<endl;
+    f<<"<VTKFile type='Collection' version='0.1'><Collection>"<<endl;
+}
+{
+    ofstream f(outdir+"waam_data.csv");
+    f<<"time_s,layer,phase,xTorch_mm,zLayer_mm,Tmax_C,TinterPass_C,epsTh_max"<<endl;
+}
+
+int frame = 0;
+
+// ============================================================
+// LAYER-BY-LAYER DEPOSITION LOOP
+// ============================================================
+cout << " === WAAM DEPOSITION ===" << endl;
+real t = 0.;
+
+for(int iL=0; iL<Nlayers; iL++){
+
+    // Z position of current layer
+    real zLayBot = HzBase + iL*hBead;
+    real zLayTop = zLayBot + hBead;
+    real zLayMid = zLayBot + hBead/2.;   // Goldak z-centre
+
+    cout << "--- Layer " << iL+1 << "/" << Nlayers
+         << "  z=[" << zLayBot*1000. << "," << zLayTop*1000. << "]mm"
+         << "  t=" << t << "s ---" << endl;
+
+    // ---- WELDING PASS: torch traverses x = 0 -> LxW ----
+    // Activate elements progressively as torch arrives at each x position
+    // Element at x_node activates when xTorch >= x_node (torch has passed it)
+    int NweldSteps = int(tPass/dtWeld)+1;
+    dt = dtWeld;
+
+    for(int ws=0; ws<=NweldSteps; ws++){
+
+        real tLocal  = ws*dtWeld;
+        real xTorch  = vscan*tLocal;
+
+        // Progressive activation: activate nodes where xTorch >= x_node
+        for(int iv=0; iv<Th.nv; iv++){
+            real xv = Th(iv).x;
+            real zv = Th(iv).z;
+            real yv = Th(iv).y;
+            if(zv >= zLayBot-1.e-6 && zv <= zLayTop+1.e-6 &&
+               yv >= yDepLeft-1.e-6 && yv <= yDepRight+1.e-6 &&
+               xv <= xTorch + af){   // activate slightly ahead of torch
+                psiActive[][iv] = 1.;
+            }
+        }
+
+        // Update material properties for all active nodes
+        for(int iv=0; iv<Th.nv; iv++){
+            real Tv = Temp0[][iv];
+            real psi = psiActive[][iv];
+            real psiEff = max(psi, 1.e-4);
+            kEff[][iv]  = kSteel(Tv)*psiEff;
+            CpEff[][iv] = CpSteel(Tv)*psiEff;
+        }
+
+        // Goldak source ONLY heats activated (existing) material
+        // Multiplying by psiActive zeros the source in quiet elements
+        // This is physically correct: the arc can only heat material that exists
+        {
+            real xT = xTorch;
+            real yT = yDepCentre;
+            real zT = zLayMid;
+            real epsSplit = 0.001;
+            real frontFrac = 0.5*(1.+tanh((x-xT)/epsSplit));
+            real rearFrac  = 1.-frontFrac;
+
+            Tsource = (Q0f*exp(-3.*(x-xT)^2/af^2)*frontFrac
+                     + Q0r*exp(-3.*(x-xT)^2/ar^2)*rearFrac)
+                    * exp(-3.*(y-yT)^2/bG^2)
+                    * exp(-3.*(z-zT)^2/cG^2)
+                    * psiActive;   // CRITICAL: zero source in quiet elements
+
+            if(xTorch<0. || xTorch>LxW) Tsource = 0.;
+        }
+
+        matrix MT = aThermal(Sh,Sh);
+        real[int] fT = lThermal(0,Sh);
+        set(MT, solver=UMFPACK);
+        Temp[] = MT^-1*fT;
+        Temp = max(Temp, Tamb);
+
+        // Accumulate thermal strain
+        for(int iv=0; iv<Th.nv; iv++)
+            epsTh[][iv] += 2.1e-5*(Temp[][iv]-Temp0[][iv]);  // alpha*dT
+
+        Temp0 = Temp;
+
+        // Save every 3 weld steps
+        if(ws%3==0){
+            string num;
+            if      (frame<  10) num="000"+frame;
+            else if (frame< 100) num="00" +frame;
+            else                  num="0"  +frame;
+
+            // TempVis: active nodes show real Temp, inactive show -1
+            // In ParaView: Threshold TempVis > 0 -> inactive layers disappear
+            for(int iv=0;iv<Th.nv;iv++)
+                TempVis[][iv] = (psiActive[][iv]>0.5) ? Temp[][iv] : -1.;
+            int[int] ord=[1,1];
+            savevtk(outdir+"T_"+num+".vtu", Th,
+                TempVis, psiActive,
+                dataname="TempC Activation", order=ord);
+
+            {
+                ofstream pv(outdir+"waam.pvd",append);
+                pv<<"  <DataSet timestep='"<<t+tLocal
+                  <<"' file='T_"<<num<<".vtu'/>"<<endl;
+            }
+            {
+                ofstream cv(outdir+"waam_data.csv",append);
+                cv<<t+tLocal<<","<<iL+1<<",WELDING,"
+                  <<xTorch*1000.<<","<<zLayMid*1000.<<","
+                  <<Temp[].max<<",,"<<epsTh[].max<<endl;
+            }
+
+            cout<<"  L"<<iL+1<<" ws="<<ws
+                <<"  x="<<xTorch*1000.<<"mm"
+                <<"  Tmax="<<Temp[].max<<"C"<<endl;
+            frame++;
+        }
+    }
+    t += tPass;
+
+    // ---- INTER-PASS COOLING ----
+    int NwaitSteps = int(tWait/dtWait);
+    dt = dtWait;
+    Tsource = 0.;
+
+    for(int iw=0; iw<NwaitSteps; iw++){
+
+        for(int iv=0; iv<Th.nv; iv++){
+            real Tv = Temp0[][iv];
+            real psiEff = max(psiActive[][iv], 1.e-4);
+            kEff[][iv]  = kSteel(Tv)*psiEff;
+            CpEff[][iv] = CpSteel(Tv)*psiEff;
+        }
+
+        matrix MT = aThermal(Sh,Sh);
+        real[int] fT = lThermal(0,Sh);
+        set(MT, solver=UMFPACK);
+        Temp[] = MT^-1*fT;
+        Temp = max(Temp, Tamb);
+        for(int iv=0; iv<Th.nv; iv++)
+            epsTh[][iv] += 2.1e-5*(Temp[][iv]-Temp0[][iv]);
+        Temp0 = Temp;
+        t += dtWait;
+    }
+
+    // Save inter-pass snapshot
+    {
+        string num;
+        if      (frame<  10) num="000"+frame;
+        else if (frame< 100) num="00" +frame;
+        else                  num="0"  +frame;
+
+        for(int iv=0;iv<Th.nv;iv++)
+            TempVis[][iv] = (psiActive[][iv]>0.5) ? Temp[][iv] : -1.;
+        int[int] ord=[1,1];
+        savevtk(outdir+"T_"+num+".vtu", Th,
+            TempVis, psiActive,
+            dataname="TempC Activation", order=ord);
+        {
+            ofstream pv(outdir+"waam.pvd",append);
+            pv<<"  <DataSet timestep='"<<t<<"' file='T_"<<num<<".vtu'/>"<<endl;
+        }
+        {
+            ofstream cv(outdir+"waam_data.csv",append);
+            cv<<t<<","<<iL+1<<",INTERPASS,0,"
+              <<zLayMid*1000.<<","<<Temp[].max<<","<<Temp[].max<<","
+              <<epsTh[].max<<endl;
+        }
+        cout<<"  -> Inter-pass cool: Tmax="<<Temp[].max<<"C  t="<<t<<"s"<<endl;
+        frame++;
+    }
+
+} // end layer loop
+
+// ============================================================
+// FINAL COOLING
+// ============================================================
+cout << " === FINAL COOLING ===" << endl;
+{
+    int NcoolSteps = 20;
+    real dtCool = 120.;
+    dt = dtCool;
+    Tsource = 0.;
+
+    for(int ic=0; ic<NcoolSteps; ic++){
+        for(int iv=0; iv<Th.nv; iv++){
+            real Tv = Temp0[][iv];
+            real psiEff = max(psiActive[][iv], 1.e-4);
+            kEff[][iv]  = kSteel(Tv)*psiEff;
+            CpEff[][iv] = CpSteel(Tv)*psiEff;
+        }
+        matrix MT = aThermal(Sh,Sh);
+        real[int] fT = lThermal(0,Sh);
+        set(MT, solver=UMFPACK);
+        Temp[] = MT^-1*fT;
+        Temp = max(Temp, Tamb);
+        for(int iv=0; iv<Th.nv; iv++)
+            epsTh[][iv] += 2.1e-5*(Temp[][iv]-Temp0[][iv]);
+        Temp0 = Temp;
+        t += dtCool;
+
+        if(ic%5==0){
+            string num;
+            if      (frame<  10) num="000"+frame;
+            else if (frame< 100) num="00" +frame;
+            else                  num="0"  +frame;
+            int[int] ord=[1,1];
+            savevtk(outdir+"T_"+num+".vtu", Th,
+                Temp, psiActive,
+                dataname="TempC Activation", order=ord);
+            {
+                ofstream pv(outdir+"waam.pvd",append);
+                pv<<"  <DataSet timestep='"<<t<<"' file='T_"<<num<<".vtu'/>"<<endl;
+            }
+            cout<<"COOL t="<<t<<"s  Tmax="<<Temp[].max<<"C"<<endl;
+            frame++;
+        }
+    }
+}
+
+{
+    ofstream pv(outdir+"waam.pvd",append);
+    pv<<"</Collection></VTKFile>"<<endl;
+}
+
+// ============================================================
+// MECHANICAL STAGE (elastic with cumulative thermal strain)
+// ============================================================
+cout << " === MECHANICAL STAGE ===" << endl;
+Sh Emod, lambdaL, muL, thermoForce;
+real nuS = 0.3;
+
+for(int iv=0; iv<Th.nv; iv++){
+    real psiEff = max(psiActive[][iv], 1.e-4);
+    // E(T) at ambient after cooling
+    real Tv = Temp[][iv];
+    real ET = 210.e9;
+    if(Tv>600.) ET = 210.e9-(210.-80.)*1.e9*(Tv-600.)/(Tsol-600.);
+    Emod[][iv] = ET*psiEff;
+}
+lambdaL    = Emod*nuS/((1.+nuS)*(1.-2.*nuS));
+muL        = Emod/(2.*(1.+nuS));
+thermoForce= (3.*lambdaL+2.*muL)*epsTh;
+
+varf aMech([ux,uy,uz],[vx,vy,vz]) =
+    int3d(Th)(
+        2.*muL*(
+            dx(ux)*dx(vx)+dy(ux)*dy(vx)+dz(ux)*dz(vx)
+          + dx(uy)*dx(vy)+dy(uy)*dy(vy)+dz(uy)*dz(vy)
+          + dx(uz)*dx(vz)+dy(uz)*dy(vz)+dz(uz)*dz(vz)
+          + 0.5*(dy(ux)+dx(uy))*(dy(vx)+dx(vy))
+          + 0.5*(dz(ux)+dx(uz))*(dz(vx)+dx(vz))
+          + 0.5*(dz(uy)+dy(uz))*(dz(vy)+dy(vz))
+        )
+        + lambdaL*(dx(ux)+dy(uy)+dz(uz))*(dx(vx)+dy(vy)+dz(vz))
+    )
+    + on(1, ux=0., uy=0., uz=0.)   // substrate bottom: fixed
+    ;
+varf lMech([ux,uy,uz],[vx,vy,vz]) =
+    int3d(Th)(thermoForce*(dx(vx)+dy(vy)+dz(vz)))
+    + on(1, ux=0., uy=0., uz=0.)
+    ;
+
+matrix KM = aMech(Vh,Vh);
+real[int] fM = lMech(0,Vh);
+set(KM, solver=UMFPACK);
+ux[] = KM^-1*fM;
+dispM = sqrt(ux^2+uy^2+uz^2);
+
+{
+    Sh sxx,syy,szz,sxy,sxz,syz;
+    sxx=lambdaL*(dx(ux)+dy(uy)+dz(uz))+2.*muL*dx(ux);
+    syy=lambdaL*(dx(ux)+dy(uy)+dz(uz))+2.*muL*dy(uy);
+    szz=lambdaL*(dx(ux)+dy(uy)+dz(uz))+2.*muL*dz(uz);
+    sxy=muL*(dy(ux)+dx(uy));
+    sxz=muL*(dz(ux)+dx(uz));
+    syz=muL*(dz(uy)+dy(uz));
+    sigM=sqrt(0.5*((sxx-syy)^2+(syy-szz)^2+(szz-sxx)^2)+3.*(sxy^2+sxz^2+syz^2));
+}
+
+{
+    int[int] ord=[1,1,1,1,1];
+    savevtk(outdir+"waam_mech.vtu", Th,
+        ux,uy,uz, dispM, sigM,
+        dataname="Ux Uy Uz DispMag SigMises",
+        order=ord);
+}
+
+cout << "==========================================" << endl;
+cout << " DONE. " << frame << " thermal frames." << endl;
+cout << " Max distortion: " << dispM[].max*1000. << " mm" << endl;
+cout << " Max von Mises:  " << sigM[].max/1.e6   << " MPa" << endl;
+cout << " OPEN: " << outdir << "waam.pvd" << endl;
+cout << " Color by TempC: hot spot moves up each layer" << endl;
+cout << " Color by Activation: watch layers build up" << endl;
+cout << " waam_mech.vtu: distortion + residual stress" << endl;
+cout << "==========================================" << endl;
